@@ -32,10 +32,12 @@ const supabaseAdmin = createClient(
 );
 
 // Gmail SMTP transporter with explicit settings
+// Gmail SMTP transporter with explicit settings
 const transporter = nodemailer.createTransport({
     host: 'smtp.gmail.com',
-    port: 465,
-    secure: true, // SSL for port 465
+    port: 587,
+    secure: false, // Use TLS
+    requireTLS: true,
     auth: {
         user: process.env.GMAIL_USER,
         pass: process.env.GMAIL_APP_PASSWORD
