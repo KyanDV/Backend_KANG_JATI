@@ -42,6 +42,10 @@ const transporter = nodemailer.createTransport({
         user: process.env.GMAIL_USER,
         pass: process.env.GMAIL_APP_PASSWORD
     },
+    tls: {
+        ciphers: 'SSLv3'
+    },
+    family: 4, // Force IPv4 to prevent Railway IPv6 timeouts
     connectionTimeout: 10000,
     greetingTimeout: 10000,
     socketTimeout: 15000
