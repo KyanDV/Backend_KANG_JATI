@@ -34,19 +34,21 @@ const supabaseAdmin = createClient(
 const transporter = nodemailer.createTransport({
     host: 'smtp.gmail.com',
     port: 587,
-    secure: false, // false untuk port 587
+    secure: false, // Wajib false untuk port 587
     auth: {
         user: process.env.GMAIL_USER,
         pass: process.env.GMAIL_APP_PASSWORD
     },
+    // Opsi TLS untuk mencegah error sertifikat
     tls: {
         rejectUnauthorized: false
     },
-    // --- PENTING: PENGATURAN KONEKSI ---
-    family: 4,              // Paksa gunakan IPv4 (Solusi anti-timeout di Railway)
-    connectionTimeout: 10000, // Tunggu koneksi sampai 10 detik
-    greetingTimeout: 10000,   // Tunggu sapaan server 10 detik
-    socketTimeout: 20000      // Tunggu data 20 detik
+    // --- BAGIAN PENTING (FIX TIMEOUT) ---
+    family: 4,              // Memaksa Node.js pakai IPv4 (Solusi Timeout Railway)
+    connectionTimeout: 10000, // Tunggu koneksi max 10 detik
+    greetingTimeout: 5000,    // Tunggu sapaan server max 5 detik
+    logger: true,             // Aktifkan log supaya terlihat di terminal Railway
+    debug: true               // Aktifkan mode debug
 });
 
 // Verifikasi koneksi email saat server start
