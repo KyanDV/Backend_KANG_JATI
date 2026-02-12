@@ -18,6 +18,19 @@ const supabase = createClient(
     process.env.SUPABASE_KEY
 );
 
+// Supabase Admin client (for Auth management)
+// Requires SERVICE_ROLE_KEY to create users
+const supabaseAdmin = createClient(
+    process.env.SUPABASE_URL,
+    process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_KEY,
+    {
+        auth: {
+            autoRefreshToken: false,
+            persistSession: false
+        }
+    }
+);
+
 // Gmail SMTP transporter with explicit settings
 const transporter = nodemailer.createTransport({
     host: 'smtp.gmail.com',
@@ -191,13 +204,34 @@ app.post('/register', async (req, res) => {
             });
         }
 
-        // 2. Hash password
+        // 2. Create User in Supabase Auth (Admin)
+        // This ensures the user exists in Auth for login
+        const { data: authData, error: authError } = await supabaseAdmin.auth.admin.createUser({
+            email: email,
+            password: password,
+            email_confirm: true // Auto confirm since we verified OTP
+        });
+
+        let userId;
+
+        if (authError) {
+            console.error('Auth Error:', authError);
+            return res.status(400).json({
+                success: false,
+                message: 'Gagal membuat akun Auth: ' + authError.message
+            });
+        } else {
+            userId = authData.user.id;
+        }
+
+        // 3. Hash password (still kept for public.users legacy)
         const passwordHash = await bcrypt.hash(password, 12);
 
-        // 3. Create User
+        // 4. Create User in public.users with SYNCED ID
         const { error: userError } = await supabase
             .from('users')
             .insert({
+                id: userId, // Gunakan ID dari Auth
                 email,
                 phone_number,
                 full_name,
@@ -207,17 +241,20 @@ app.post('/register', async (req, res) => {
             });
 
         if (userError) {
+            // Rollback: Delete Auth user if public insert fails
+            await supabaseAdmin.auth.admin.deleteUser(userId);
+
             // Check for duplicate key error (email or phone)
             if (userError.code === '23505') {
                 return res.status(400).json({
                     success: false,
-                    message: 'Email atau Nomor HP sudah terdaftar'
+                    message: 'Email atau Nomor HP sudah terdaftar di database publik'
                 });
             }
             throw userError;
         }
 
-        // 4. Mark OTP as used
+        // 5. Mark OTP as used
         await supabase
             .from('otp_codes')
             .update({ used: true })
