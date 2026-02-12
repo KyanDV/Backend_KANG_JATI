@@ -60,7 +60,8 @@ app.get('/health', (req, res) => {
 // Send OTP endpoint
 app.post('/send-otp', async (req, res) => {
     try {
-        const { email } = req.body;
+        let { email } = req.body;
+        if (email) email = email.toLowerCase();
 
         if (!email) {
             return res.status(400).json({ success: false, message: 'Email diperlukan' });
@@ -73,29 +74,50 @@ app.post('/send-otp', async (req, res) => {
         }
 
         // Generate OTP and expiry (5 minutes from now)
-        const otp = generateOTP();
-        const expiresAt = new Date(Date.now() + 5 * 60 * 1000);
-
-        // Invalidate any existing OTPs for this email
-        await supabase
+        // Check for existing active OTP created recently (spam click prevention)
+        const { data: existingOTP } = await supabase
             .from('otp_codes')
-            .update({ used: true })
+            .select('*')
             .eq('email', email)
-            .eq('used', false);
+            .eq('used', false)
+            .gte('created_at', new Date(Date.now() - 60 * 1000).toISOString()) // Created within last 60s
+            .order('created_at', { ascending: false })
+            .limit(1)
+            .maybeSingle();
 
-        // Store OTP in database
-        const { error: dbError } = await supabase
-            .from('otp_codes')
-            .insert({
-                email: email,
-                code: otp,
-                expires_at: expiresAt.toISOString(),
-                used: false
-            });
+        let otp;
+        let expiresAt;
 
-        if (dbError) {
-            console.error('Database error:', dbError);
-            return res.status(500).json({ success: false, message: 'Gagal menyimpan OTP' });
+        if (existingOTP) {
+            console.log(`Resending EXISTING OTP to ${email} (Anti-Spam)`);
+            otp = existingOTP.code;
+            // No need to insert new DB record
+        } else {
+            // Generate NEW OTP
+            otp = generateOTP();
+            expiresAt = new Date(Date.now() + 5 * 60 * 1000);
+
+            // Invalidate OLD OTPs
+            await supabase
+                .from('otp_codes')
+                .update({ used: true })
+                .eq('email', email)
+                .eq('used', false);
+
+            // Store NEW OTP
+            const { error: dbError } = await supabase
+                .from('otp_codes')
+                .insert({
+                    email: email,
+                    code: otp,
+                    expires_at: expiresAt.toISOString(),
+                    used: false
+                });
+
+            if (dbError) {
+                console.error('Database error:', dbError);
+                return res.status(500).json({ success: false, message: 'Gagal menyimpan OTP' });
+            }
         }
 
         // Send email
@@ -155,6 +177,20 @@ app.post('/verify-otp', async (req, res) => {
             .single();
 
         if (fetchError || !otpData) {
+            console.log(`Verify Failed for ${email}. Input: ${otp}`);
+            // Cek apakah ada OTP lain yang valid tapi beda kode (kasus spam klik)
+            const { data: latestOTP } = await supabase
+                .from('otp_codes')
+                .select('*')
+                .eq('email', email)
+                .order('created_at', { ascending: false })
+                .limit(1)
+                .single();
+
+            if (latestOTP) {
+                console.log(`Latest Valid OTP in DB: ${latestOTP.code} (Status: ${latestOTP.used ? 'Used' : 'Active'})`);
+            }
+
             return res.status(400).json({
                 success: false,
                 message: 'Kode OTP tidak valid atau sudah kadaluarsa'
@@ -178,9 +214,11 @@ app.post('/verify-otp', async (req, res) => {
 
 app.post('/register', async (req, res) => {
     try {
-        const { email, phone_number, full_name, password, otp, role } = req.body;
+        let { email, phone_number, full_name, password, otp, role } = req.body;
+        if (email) email = email.toLowerCase();
 
         if (!email || !phone_number || !full_name || !password || !otp || !role) {
+            console.log('Register Error: Missing fields', req.body);
             return res.status(400).json({
                 success: false,
                 message: 'Semua field wajib diisi (termasuk OTP)'
@@ -200,6 +238,18 @@ app.post('/register', async (req, res) => {
             .single();
 
         if (fetchError || !otpData) {
+            console.log(`[Register] OTP Verify Failed for ${email}. Input: ${otp}`);
+
+            // Debug: Check what IS in the DB
+            const { data: dbOtps } = await supabase
+                .from('otp_codes')
+                .select('*')
+                .eq('email', email)
+                .order('created_at', { ascending: false })
+                .limit(3);
+
+            console.log('Recent OTPs in DB:', dbOtps);
+
             return res.status(400).json({
                 success: false,
                 message: 'Kode OTP tidak valid atau sudah kadaluarsa'
@@ -207,21 +257,53 @@ app.post('/register', async (req, res) => {
         }
 
         // 2. Create User in Supabase Auth (Admin)
-        // This ensures the user exists in Auth for login
+        let userId;
         const { data: authData, error: authError } = await supabaseAdmin.auth.admin.createUser({
             email: email,
             password: password,
             email_confirm: true // Auto confirm since we verified OTP
         });
 
-        let userId;
-
         if (authError) {
-            console.error('Auth Error:', authError);
-            return res.status(400).json({
-                success: false,
-                message: 'Gagal membuat akun Auth: ' + authError.message
-            });
+            // Check if user already exists (Zombie User scenario)
+            if (authError.message.includes('already registered') || authError.status === 422) {
+                console.log('User already in Auth, checking public.users...');
+
+                // 1. Check if it's a REAL duplicate (already in public DB)
+                const { data: existingPublicUser } = await supabase
+                    .from('users')
+                    .select('id')
+                    .eq('email', email)
+                    .maybeSingle();
+
+                if (existingPublicUser) {
+                    return res.status(400).json({ success: false, message: 'Email sudah terdaftar sepenuhnya.' });
+                }
+
+                // 2. It's a Zombie (Auth exists, Public missing). Try to recover ID via Login.
+                // We use signInWithPassword to prove ownership (re-using the password they just sent)
+                const { data: loginData, error: loginError } = await supabase.auth.signInWithPassword({
+                    email: email,
+                    password: password
+                });
+
+                if (loginError || !loginData.user) {
+                    console.error('Zombie recovery failed:', loginError);
+                    return res.status(400).json({
+                        success: false,
+                        message: 'Email sudah terdaftar. Password mungkin salah atau akun terkunci.'
+                    });
+                }
+
+                console.log('Zombie Recovered! ID:', loginData.user.id);
+                userId = loginData.user.id; // Use existing ID
+            } else {
+                console.error('Auth Error:', authError);
+                return res.status(400).json({
+                    success: false,
+                    message: 'Gagal membuat akun Auth: ' + authError.message
+                });
+            }
         } else {
             userId = authData.user.id;
         }
@@ -248,6 +330,7 @@ app.post('/register', async (req, res) => {
 
             // Check for duplicate key error (email or phone)
             if (userError.code === '23505') {
+                console.log('Register Error: Duplicate User', userError.message);
                 return res.status(400).json({
                     success: false,
                     message: 'Email atau Nomor HP sudah terdaftar di database publik'
