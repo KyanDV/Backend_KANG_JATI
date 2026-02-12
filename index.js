@@ -30,18 +30,23 @@ const supabaseAdmin = createClient(
     }
 );
 
-// --- KONFIGURASI SMTP (Port 587) ---
+// --- KONFIGURASI SMTP GMAIL (FIX RAILWAY IPV4) ---
 const transporter = nodemailer.createTransport({
     host: 'smtp.gmail.com',
     port: 587,
-    secure: false, // False untuk port 587
+    secure: false, // false untuk port 587
     auth: {
         user: process.env.GMAIL_USER,
         pass: process.env.GMAIL_APP_PASSWORD
     },
     tls: {
         rejectUnauthorized: false
-    }
+    },
+    // --- PENTING: PENGATURAN KONEKSI ---
+    family: 4,              // Paksa gunakan IPv4 (Solusi anti-timeout di Railway)
+    connectionTimeout: 10000, // Tunggu koneksi sampai 10 detik
+    greetingTimeout: 10000,   // Tunggu sapaan server 10 detik
+    socketTimeout: 20000      // Tunggu data 20 detik
 });
 
 // Verifikasi koneksi email saat server start
