@@ -12,14 +12,13 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
-// Supabase client
+// Supabase client (Anon Key - untuk read publik/RLS)
 const supabase = createClient(
     process.env.SUPABASE_URL,
     process.env.SUPABASE_KEY
 );
 
-// Supabase Admin client (for Auth management)
-// Requires SERVICE_ROLE_KEY to create users
+// Supabase Admin client (Service Role - untuk Auth & Write bypass RLS)
 const supabaseAdmin = createClient(
     process.env.SUPABASE_URL,
     process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_KEY,
@@ -31,25 +30,31 @@ const supabaseAdmin = createClient(
     }
 );
 
-// Gmail SMTP transporter with explicit settings
-// Gmail SMTP transporter with explicit settings
+// --- PERBAIKAN CONFIG SMTP ---
 const transporter = nodemailer.createTransport({
     host: 'smtp.gmail.com',
-    port: 587,
-    secure: false, // Use TLS
-    requireTLS: true,
+    port: 465, // Gunakan Port 465 untuk koneksi SSL langsung
+    secure: true, // True untuk port 465
     auth: {
         user: process.env.GMAIL_USER,
-        pass: process.env.GMAIL_APP_PASSWORD
+        pass: process.env.GMAIL_APP_PASSWORD // Wajib App Password
     },
+    // Hapus ciphers SSLv3 yang bikin error
     tls: {
-        ciphers: 'SSLv3'
+        rejectUnauthorized: false // Membantu koneksi di cloud environment
     },
-    family: 4, // Force IPv4 to prevent Railway IPv6 timeouts
-    connectionTimeout: 10000,
-    greetingTimeout: 10000,
-    socketTimeout: 15000
+    family: 4 // Force IPv4 untuk mencegah timeout IPv6 di Railway
 });
+
+// Verifikasi koneksi email saat server start
+transporter.verify(function (error, success) {
+    if (error) {
+        console.error('❌ Gagal koneksi ke Gmail:', error);
+    } else {
+        console.log('✅ Siap mengirim email');
+    }
+});
+// -----------------------------
 
 // Generate 6-digit OTP
 function generateOTP() {
@@ -77,14 +82,13 @@ app.post('/send-otp', async (req, res) => {
             return res.status(400).json({ success: false, message: 'Format email tidak valid' });
         }
 
-        // Generate OTP and expiry (5 minutes from now)
-        // Check for existing active OTP created recently (spam click prevention)
+        // Cek OTP existing (Anti Spam)
         const { data: existingOTP } = await supabase
             .from('otp_codes')
             .select('*')
             .eq('email', email)
             .eq('used', false)
-            .gte('created_at', new Date(Date.now() - 60 * 1000).toISOString()) // Created within last 60s
+            .gte('created_at', new Date(Date.now() - 60 * 1000).toISOString()) // 60 detik terakhir
             .order('created_at', { ascending: false })
             .limit(1)
             .maybeSingle();
@@ -93,22 +97,21 @@ app.post('/send-otp', async (req, res) => {
         let expiresAt;
 
         if (existingOTP) {
-            console.log(`Resending EXISTING OTP to ${email} (Anti-Spam)`);
+            console.log(`Resending EXISTING OTP to ${email}`);
             otp = existingOTP.code;
-            // No need to insert new DB record
         } else {
-            // Generate NEW OTP
+            // Generate OTP Baru
             otp = generateOTP();
-            expiresAt = new Date(Date.now() + 5 * 60 * 1000);
+            expiresAt = new Date(Date.now() + 5 * 60 * 1000); // 5 menit
 
-            // Invalidate OLD OTPs
+            // Matikan OTP lama
             await supabase
                 .from('otp_codes')
                 .update({ used: true })
                 .eq('email', email)
                 .eq('used', false);
 
-            // Store NEW OTP
+            // Simpan OTP Baru
             const { error: dbError } = await supabase
                 .from('otp_codes')
                 .insert({
@@ -124,7 +127,7 @@ app.post('/send-otp', async (req, res) => {
             }
         }
 
-        // Send email
+        // Template Email
         const mailOptions = {
             from: `"Aplikasi Tukang PUPR" <${process.env.GMAIL_USER}>`,
             to: email,
@@ -140,14 +143,11 @@ app.post('/send-otp', async (req, res) => {
             Kode ini berlaku selama <strong>5 menit</strong>.<br>
             Jangan bagikan kode ini kepada siapapun.
           </p>
-          <hr style="border: none; border-top: 1px solid #eee; margin: 20px 0;">
-          <p style="color: #999; font-size: 12px;">
-            Jika Anda tidak meminta kode ini, abaikan email ini.
-          </p>
         </div>
       `
         };
 
+        // Kirim Email
         await transporter.sendMail(mailOptions);
 
         console.log(`OTP sent to ${email}`);
@@ -155,7 +155,7 @@ app.post('/send-otp', async (req, res) => {
 
     } catch (error) {
         console.error('Error sending OTP:', error);
-        res.status(500).json({ success: false, message: 'Gagal mengirim OTP: ' + error.message });
+        res.status(500).json({ success: false, message: 'Gagal mengirim email OTP' });
     }
 });
 
@@ -168,7 +168,6 @@ app.post('/verify-otp', async (req, res) => {
             return res.status(400).json({ success: false, message: 'Email dan OTP diperlukan' });
         }
 
-        // Find valid OTP
         const { data: otpData, error: fetchError } = await supabase
             .from('otp_codes')
             .select('*')
@@ -181,20 +180,6 @@ app.post('/verify-otp', async (req, res) => {
             .single();
 
         if (fetchError || !otpData) {
-            console.log(`Verify Failed for ${email}. Input: ${otp}`);
-            // Cek apakah ada OTP lain yang valid tapi beda kode (kasus spam klik)
-            const { data: latestOTP } = await supabase
-                .from('otp_codes')
-                .select('*')
-                .eq('email', email)
-                .order('created_at', { ascending: false })
-                .limit(1)
-                .single();
-
-            if (latestOTP) {
-                console.log(`Latest Valid OTP in DB: ${latestOTP.code} (Status: ${latestOTP.used ? 'Used' : 'Active'})`);
-            }
-
             return res.status(400).json({
                 success: false,
                 message: 'Kode OTP tidak valid atau sudah kadaluarsa'
@@ -207,7 +192,6 @@ app.post('/verify-otp', async (req, res) => {
             .update({ used: true })
             .eq('id', otpData.id);
 
-        console.log(`OTP verified for ${email}`);
         res.json({ success: true, message: 'OTP berhasil diverifikasi' });
 
     } catch (error) {
@@ -222,7 +206,6 @@ app.post('/register', async (req, res) => {
         if (email) email = email.toLowerCase();
 
         if (!email || !phone_number || !full_name || !password || !otp || !role) {
-            console.log('Register Error: Missing fields', req.body);
             return res.status(400).json({
                 success: false,
                 message: 'Semua field wajib diisi (termasuk OTP)'
@@ -242,18 +225,6 @@ app.post('/register', async (req, res) => {
             .single();
 
         if (fetchError || !otpData) {
-            console.log(`[Register] OTP Verify Failed for ${email}. Input: ${otp}`);
-
-            // Debug: Check what IS in the DB
-            const { data: dbOtps } = await supabase
-                .from('otp_codes')
-                .select('*')
-                .eq('email', email)
-                .order('created_at', { ascending: false })
-                .limit(3);
-
-            console.log('Recent OTPs in DB:', dbOtps);
-
             return res.status(400).json({
                 success: false,
                 message: 'Kode OTP tidak valid atau sudah kadaluarsa'
@@ -265,15 +236,14 @@ app.post('/register', async (req, res) => {
         const { data: authData, error: authError } = await supabaseAdmin.auth.admin.createUser({
             email: email,
             password: password,
-            email_confirm: true // Auto confirm since we verified OTP
+            email_confirm: true
         });
 
         if (authError) {
-            // Check if user already exists (Zombie User scenario)
             if (authError.message.includes('already registered') || authError.status === 422) {
-                console.log('User already in Auth, checking public.users...');
+                console.log('User exists in Auth, trying recovery...');
 
-                // 1. Check if it's a REAL duplicate (already in public DB)
+                // Cek user di public table
                 const { data: existingPublicUser } = await supabase
                     .from('users')
                     .select('id')
@@ -284,25 +254,20 @@ app.post('/register', async (req, res) => {
                     return res.status(400).json({ success: false, message: 'Email sudah terdaftar sepenuhnya.' });
                 }
 
-                // 2. It's a Zombie (Auth exists, Public missing). Try to recover ID via Login.
-                // We use signInWithPassword to prove ownership (re-using the password they just sent)
+                // Coba recover ID lewat login
                 const { data: loginData, error: loginError } = await supabase.auth.signInWithPassword({
                     email: email,
                     password: password
                 });
 
                 if (loginError || !loginData.user) {
-                    console.error('Zombie recovery failed:', loginError);
                     return res.status(400).json({
                         success: false,
-                        message: 'Email sudah terdaftar. Password mungkin salah atau akun terkunci.'
+                        message: 'Email terdaftar di Auth tapi gagal login. Password mungkin beda.'
                     });
                 }
-
-                console.log('Zombie Recovered! ID:', loginData.user.id);
-                userId = loginData.user.id; // Use existing ID
+                userId = loginData.user.id;
             } else {
-                console.error('Auth Error:', authError);
                 return res.status(400).json({
                     success: false,
                     message: 'Gagal membuat akun Auth: ' + authError.message
@@ -312,14 +277,14 @@ app.post('/register', async (req, res) => {
             userId = authData.user.id;
         }
 
-        // 3. Hash password (still kept for public.users legacy)
+        // 3. Hash password (legacy support)
         const passwordHash = await bcrypt.hash(password, 12);
 
-        // 4. Create User in public.users with SYNCED ID
-        const { error: userError } = await supabase
+        // 4. Create User in public.users
+        const { error: userError } = await supabaseAdmin // Gunakan Admin client untuk bypass RLS insert
             .from('users')
             .insert({
-                id: userId, // Gunakan ID dari Auth
+                id: userId,
                 email,
                 phone_number,
                 full_name,
@@ -329,15 +294,13 @@ app.post('/register', async (req, res) => {
             });
 
         if (userError) {
-            // Rollback: Delete Auth user if public insert fails
-            await supabaseAdmin.auth.admin.deleteUser(userId);
+            // Rollback Auth jika insert DB gagal (hanya jika user baru dibuat)
+            if (!authError) await supabaseAdmin.auth.admin.deleteUser(userId);
 
-            // Check for duplicate key error (email or phone)
             if (userError.code === '23505') {
-                console.log('Register Error: Duplicate User', userError.message);
                 return res.status(400).json({
                     success: false,
-                    message: 'Email atau Nomor HP sudah terdaftar di database publik'
+                    message: 'Email atau Nomor HP sudah terdaftar'
                 });
             }
             throw userError;
@@ -355,10 +318,10 @@ app.post('/register', async (req, res) => {
         });
 
     } catch (err) {
-        console.error(err);
+        console.error('Register Error:', err);
         res.status(500).json({
             success: false,
-            message: 'Gagal registrasi: ' + err.message
+            message: 'Gagal registrasi server error'
         });
     }
 });
@@ -368,41 +331,27 @@ app.post('/login', async (req, res) => {
         const { identifier, password } = req.body;
 
         if (!identifier || !password) {
-            return res.status(400).json({
-                success: false,
-                message: 'Identifier dan password wajib diisi'
-            });
+            return res.status(400).json({ success: false, message: 'Identifier dan password wajib diisi' });
         }
 
-        // cari user by email atau phone
+        // Cari user
         const { data: user, error } = await supabase
             .from('users')
             .select('*')
             .or(`email.eq.${identifier},phone_number.eq.${identifier}`)
             .eq('is_verified', true)
-            .single();
+            .maybeSingle(); // Gunakan maybeSingle agar tidak error jika null
 
         if (error || !user) {
-            return res.status(401).json({
-                success: false,
-                message: 'User tidak ditemukan'
-            });
+            return res.status(401).json({ success: false, message: 'User tidak ditemukan' });
         }
 
-        // compare password
-        const isValid = await bcrypt.compare(
-            password,
-            user.password_hash
-        );
+        const isValid = await bcrypt.compare(password, user.password_hash);
 
         if (!isValid) {
-            return res.status(401).json({
-                success: false,
-                message: 'Password salah'
-            });
+            return res.status(401).json({ success: false, message: 'Password salah' });
         }
 
-        // TODO: generate JWT
         res.json({
             success: true,
             message: 'Login berhasil',
@@ -415,22 +364,15 @@ app.post('/login', async (req, res) => {
 
     } catch (err) {
         console.error(err);
-        res.status(500).json({
-            success: false,
-            message: 'Gagal login'
-        });
+        res.status(500).json({ success: false, message: 'Gagal login' });
     }
 });
-
 
 // Admin: Update User Profile
 app.post('/admin/update-user', async (req, res) => {
     try {
         const { userId, full_name, phone_number, daily_rate } = req.body;
-
-        if (!userId) {
-            return res.status(400).json({ success: false, message: 'User ID diperlukan' });
-        }
+        if (!userId) return res.status(400).json({ success: false, message: 'User ID diperlukan' });
 
         const updateData = {};
         if (full_name) updateData.full_name = full_name;
@@ -444,406 +386,13 @@ app.post('/admin/update-user', async (req, res) => {
             .select()
             .single();
 
-        if (error) {
-            throw error;
-        }
-
-        res.json({
-            success: true,
-            message: 'Profil berhasil diperbarui',
-            data
-        });
-
-    } catch (err) {
-        console.error('Error update user:', err);
-        res.status(500).json({
-            success: false,
-            message: 'Gagal memperbarui profil: ' + err.message
-        });
-    }
-});
-
-// Admin: Reset Password
-app.post('/admin/reset-password', async (req, res) => {
-    try {
-        const { userId } = req.body;
-
-        if (!userId) {
-            return res.status(400).json({ success: false, message: 'User ID diperlukan' });
-        }
-
-        // Hash default password '12345678'
-        const passwordHash = await bcrypt.hash('12345678', 12);
-
-        const { data, error } = await supabase
-            .from('users')
-            .update({ password_hash: passwordHash })
-            .eq('id', userId)
-            .select()
-            .single();
-
-        if (error) {
-            throw error;
-        }
-
-        res.json({
-            success: true,
-            message: 'Password berhasil direset ke 12345678'
-        });
-
-    } catch (err) {
-        console.error('Error reset password:', err);
-        res.status(500).json({
-            success: false,
-            message: 'Gagal reset password: ' + err.message
-        });
-    }
-});
-
-// Admin: Delete User
-app.post('/admin/delete-user', async (req, res) => {
-    try {
-        const { userId } = req.body;
-
-        if (!userId) {
-            return res.status(400).json({ success: false, message: 'User ID diperlukan' });
-        }
-
-        const { error } = await supabase
-            .from('users')
-            .delete()
-            .eq('id', userId);
-
-        if (error) {
-            throw error;
-        }
-
-        res.json({
-            success: true,
-            message: 'User berhasil dihapus'
-        });
-
-    } catch (err) {
-        console.error('Error delete user:', err);
-        res.status(500).json({
-            success: false,
-            message: 'Gagal menghapus user: ' + err.message
-        });
-    }
-});
-
-// User: Change Password
-app.post('/change-password', async (req, res) => {
-    try {
-        const { userId, oldPassword, newPassword } = req.body;
-
-        if (!userId || !oldPassword || !newPassword) {
-            return res.status(400).json({ success: false, message: 'Data tidak lengkap' });
-        }
-
-        // 1. Get user to verify old password
-        const { data: user, error: fetchError } = await supabase
-            .from('users')
-            .select('password_hash')
-            .eq('id', userId)
-            .single();
-
-        if (fetchError || !user) {
-            return res.status(404).json({ success: false, message: 'User tidak ditemukan' });
-        }
-
-        // 2. Verify Old Password
-        const match = await bcrypt.compare(oldPassword, user.password_hash);
-        if (!match) {
-            return res.status(400).json({ success: false, message: 'Password lama salah' });
-        }
-
-        // 3. Hash New Password
-        const newPasswordHash = await bcrypt.hash(newPassword, 12);
-
-        // 4. Update Password
-        const { error: updateError } = await supabase
-            .from('users')
-            .update({ password_hash: newPasswordHash })
-            .eq('id', userId);
-
-        if (updateError) {
-            throw updateError;
-        }
-
-        res.json({
-            success: true,
-            message: 'Password berhasil diubah'
-        });
-
-    } catch (err) {
-        console.error('Error change password:', err);
-        res.status(500).json({
-            success: false,
-            message: 'Gagal mengubah password: ' + err.message
-        });
-    }
-});
-
-app.post('/change-profile', async (req, res) => {
-    try {
-        const { userId, fullName, phoneNumber } = req.body;
-
-        if (!userId || !fullName || !phoneNumber) {
-            return res.status(400).json({ success: false, message: 'Data tidak lengkap' });
-        }
-
-
-        const { error: updateError } = await supabase
-            .from('users')
-            .update({
-                'full_name': fullName,
-                'phone_number': phoneNumber,
-            })
-            .eq('id', userId);
-
-        if (updateError) {
-            throw updateError;
-        }
-
-        res.json({
-            success: true,
-            message: 'Profil berhasil diubah'
-        });
-    } catch (err) {
-        console.error('Error change profile:', err);
-        res.status(500).json({
-            success: false,
-            message: 'Gagal mengubah profil: ' + err.message,
-        })
-    }
-});
-
-app.post('/change-location', async (req, res) => {
-    try {
-        const { userId, latitude, longitude, isWorking } = req.body;
-
-        if (!userId || !latitude || !longitude) {
-            return res.status(400).json({ success: false, message: 'Data tidak lengkap' });
-        }
-
-        console.log(isWorking);
-        if (isWorking !== null) {
-            const { error: updateError } = await supabase
-                .from('users')
-                .update({
-                    'is_working': isWorking,
-                    'latitude': latitude,
-                    'longitude': longitude,
-                })
-                .eq('id', userId);
-
-            if (updateError) {
-                throw updateError;
-            }
-        } else {
-            const { error: updateError } = await supabase
-                .from('users')
-                .update({
-                    'latitude': latitude,
-                    'longitude': longitude,
-                })
-                .eq('id', userId);
-
-            if (updateError) {
-                throw updateError;
-            }
-        }
-
-        res.json({
-            success: true,
-            message: 'Lokasi berhasil diubah'
-        });
-    } catch (err) {
-        console.error('Error change location:', err);
-        res.status(500).json({
-            success: false,
-            message: 'Gagal mengubah lokasi: ' + err.message,
-        })
-    }
-});
-
-// Worker: Add Skill
-app.post('/worker/add-skill', async (req, res) => {
-    try {
-        const { userId, skillName, certificateUrl } = req.body;
-
-        if (!userId || !skillName || !certificateUrl) {
-            return res.status(400).json({ success: false, message: 'Data tidak lengkap' });
-        }
-
-        // 1. Ensure worker_info exists
-        const { data: workerInfo, error: infoError } = await supabase
-            .from('worker_info')
-            .select('id')
-            .eq('user_id', userId)
-            .maybeSingle();
-
-        if (infoError) throw infoError;
-
-        let workerId;
-        if (!workerInfo) {
-            const { data: newWorker, error: createError } = await supabase
-                .from('worker_info')
-                .insert({ user_id: userId })
-                .select()
-                .single();
-            if (createError) throw createError;
-            workerId = newWorker.id;
-        } else {
-            workerId = workerInfo.id;
-        }
-
-        // 2. Insert Skill
-        const { error: skillError } = await supabase
-            .from('worker_skills')
-            .insert({
-                worker_id: workerId,
-                skill_name: skillName,
-                certificate_url: certificateUrl,
-                verification_status: 'pending'
-            });
-
-        if (skillError) throw skillError;
-
-        res.json({
-            success: true,
-            message: 'Keahlian berhasil ditambahkan dan menunggu verifikasi'
-        });
-
-    } catch (err) {
-        console.error('Error add skill:', err);
-        res.status(500).json({
-            success: false,
-            message: 'Gagal menambahkan keahlian: ' + err.message,
-        })
-    }
-});
-
-// Admin: Verify Skill
-app.post('/admin/verify-skill', async (req, res) => {
-    try {
-        const { skillId, status } = req.body;
-
-        if (!skillId || !['verified', 'rejected', 'pending'].includes(status)) {
-            return res.status(400).json({ success: false, message: 'Data invalid' });
-        }
-
-        const { error } = await supabase
-            .from('worker_skills')
-            .update({ verification_status: status })
-            .eq('id', skillId);
-
         if (error) throw error;
 
-        res.json({
-            success: true,
-            message: `Status keahlian diubah menjadi ${status}`
-        });
+        res.json({ success: true, message: 'Profil berhasil diperbarui', data });
 
     } catch (err) {
-        console.error('Error verify skill:', err);
-        res.status(500).json({
-            success: false,
-            message: 'Gagal verifikasi: ' + err.message,
-        })
-    }
-});
-
-// Worker: Initial Verification (KTP + First Skill)
-app.post('/worker/submit-initial', async (req, res) => {
-    try {
-        const { userId, ktpUrl, address, skillName, certificateUrl } = req.body;
-
-        if (!userId || !ktpUrl || !address || !skillName || !certificateUrl) {
-            return res.status(400).json({ success: false, message: 'Data tidak lengkap' });
-        }
-
-        // 1. Upsert worker_info (Update Account Status & KTP)
-        const { data: workerInfo, error: infoError } = await supabase
-            .from('worker_info')
-            .upsert({
-                user_id: userId,
-                address: address,
-                ktp_url: ktpUrl,
-                account_status: 'pending' // Set directly to pending
-            }, { onConflict: 'user_id' })
-            .select()
-            .single();
-
-        if (infoError) throw infoError;
-
-        // 2. Insert First Skill
-        const { error: skillError } = await supabase
-            .from('worker_skills')
-            .insert({
-                worker_id: workerInfo.id,
-                skill_name: skillName,
-                certificate_url: certificateUrl,
-                verification_status: 'pending'
-            });
-
-        if (skillError) throw skillError;
-
-        res.json({
-            success: true,
-            message: 'Verifikasi berhasil dikirim. Mohon tunggu persetujuan admin.'
-        });
-
-    } catch (err) {
-        console.error('Error submit initial:', err);
-        res.status(500).json({
-            success: false,
-            message: 'Gagal mengirim data: ' + err.message,
-        })
-    }
-});
-
-// Admin: Verify Account (Unified - Account + All Pending Skills)
-app.post('/admin/verify-account', async (req, res) => {
-    try {
-        const { userId, status } = req.body;
-
-        if (!userId || !['verified', 'rejected'].includes(status)) {
-            return res.status(400).json({ success: false, message: 'Data invalid' });
-        }
-
-        // 1. Update Worker Info
-        const { data: workerInfo, error: infoError } = await supabase
-            .from('worker_info')
-            .update({ account_status: status })
-            .eq('user_id', userId)
-            .select()
-            .single();
-
-        if (infoError) throw infoError;
-
-        // 2. Update ALL Pending Skills for this worker
-        // This fulfills the "One Click" requirement
-        const { error: skillError } = await supabase
-            .from('worker_skills')
-            .update({ verification_status: status })
-            .eq('worker_id', workerInfo.id)
-            .eq('verification_status', 'pending'); // Only update pending ones
-
-        if (skillError) throw skillError;
-
-        res.json({
-            success: true,
-            message: `Akun dan keahlian berhasil di-${status}`
-        });
-
-    } catch (err) {
-        console.error('Error verify account:', err);
-        res.status(500).json({
-            success: false,
-            message: 'Gagal verifikasi: ' + err.message,
-        })
+        console.error(err);
+        res.status(500).json({ success: false, message: 'Gagal update' });
     }
 });
 
@@ -851,5 +400,4 @@ app.post('/admin/verify-account', async (req, res) => {
 app.listen(PORT, () => {
     console.log(`🚀 OTP Server running on port ${PORT}`);
     console.log(`📧 Gmail: ${process.env.GMAIL_USER}`);
-    console.log(`🔗 Supabase: ${process.env.SUPABASE_URL}`);
 });
