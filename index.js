@@ -102,9 +102,98 @@ app.post('/send-otp', async (req, res) => {
     }
 });
 
-// Endpoint lain (Register/Login/Verify) tetap sama seperti sebelumnya...
-// (Untuk menghemat tempat, gunakan endpoint Register/Login dari kode sebelumnya)
-// Pastikan endpoint Register/Login ada di sini
+// --- REGISTER ---
+app.post('/register', async (req, res) => {
+    try {
+        const { full_name, email, phone_number, password, otp, role } = req.body;
+
+        // 1. Verifikasi OTP
+        const { data: otpData, error: otpError } = await supabase
+            .from('otp_codes')
+            .select('*')
+            .eq('email', email)
+            .eq('code', otp)
+            .eq('used', false)
+            .gt('expires_at', new Date().toISOString())
+            .single();
+
+        if (otpError || !otpData) {
+            return res.status(400).json({ success: false, message: 'OTP Salah atau Kadaluarsa' });
+        }
+
+        // 2. Tandai OTP sudah dipakai
+        await supabase.from('otp_codes').update({ used: true }).eq('id', otpData.id);
+
+        // 3. Cek User Exist di Table Public
+        const { data: existingUser } = await supabase
+            .from('users')
+            .select('id')
+            .or(`email.eq.${email},phone_number.eq.${phone_number}`)
+            .single();
+
+        if (existingUser) {
+            return res.status(400).json({ success: false, message: 'Email atau No HP sudah terdaftar' });
+        }
+
+        // 4. Register ke Supabase Auth (Optional, tapi bagus untuk security)
+        // Kita pakai password hash manual di table user untuk simplicitas sesuai request awal
+        // Tapi best practice tetap sync ke Auth. Di sini kita fokus ke Table Users dulu.
+
+        const hashedPassword = await bcrypt.hash(password, 10);
+
+        // 5. Simpan ke Table Users
+        const { data: newUser, error: insertError } = await supabase
+            .from('users')
+            .insert({
+                email,
+                phone_number,
+                full_name,
+                password_hash: hashedPassword,
+                user_role: [role], // Array
+                is_verified: true // Karena sudah verify OTP
+            })
+            .select()
+            .single();
+
+        if (insertError) throw insertError;
+
+        res.json({ success: true, message: 'Registrasi Berhasil', user: newUser });
+
+    } catch (err) {
+        console.error("Register Error:", err);
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+// --- LOGIN ---
+app.post('/login', async (req, res) => {
+    try {
+        const { identifier, password } = req.body; // identifier = email OR phone
+
+        // Cari user by Email OR Phone
+        const { data: user, error } = await supabase
+            .from('users')
+            .select('*')
+            .or(`email.eq.${identifier},phone_number.eq.${identifier}`)
+            .single();
+
+        if (error || !user) {
+            return res.status(400).json({ success: false, message: 'User tidak ditemukan' });
+        }
+
+        // Cek Password
+        const validPassword = await bcrypt.compare(password, user.password_hash);
+        if (!validPassword) {
+            return res.status(400).json({ success: false, message: 'Password Salah' });
+        }
+
+        res.json({ success: true, message: 'Login Berhasil', user });
+
+    } catch (err) {
+        console.error("Login Error:", err);
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
 
 app.listen(PORT, () => {
     console.log(`🚀 Server running on port ${PORT}`);
